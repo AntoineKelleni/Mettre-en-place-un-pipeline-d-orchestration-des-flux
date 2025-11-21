@@ -1,0 +1,420 @@
+id: bottleneck_workflow
+namespace: bottleneck
+
+tasks:
+  # 1) Conversion des fichiers Excel en CSV
+  - id: convert_erp
+    type: io.kestra.plugin.scripts.shell.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      PIP_ROOT_USER_ACTION: "ignore"
+    outputFiles:
+      - "erp.csv"
+    script: |
+      pip install --quiet openpyxl
+      python - << 'EOF'
+      import warnings
+      warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+      import pandas as pd
+      df = pd.read_excel("data/Fichier_erp.xlsx")
+      print("convert_erp - shape Excel:", df.shape)
+      df.to_csv("erp.csv", index=False)
+      print("convert_erp - CSV écrit -> erp.csv")
+      EOF
+
+  - id: convert_web
+    type: io.kestra.plugin.scripts.shell.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      PIP_ROOT_USER_ACTION: "ignore"
+    outputFiles:
+      - "web.csv"
+    script: |
+      pip install --quiet openpyxl
+      python - << 'EOF'
+      import warnings
+      warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+      import pandas as pd
+      df = pd.read_excel("data/Fichier_web.xlsx")
+      print("convert_web - shape Excel:", df.shape)
+      df.to_csv("web.csv", index=False)
+      print("convert_web - CSV écrit -> web.csv")
+      EOF
+
+  - id: convert_liaison
+    type: io.kestra.plugin.scripts.shell.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: ghcr.io/kestra-io/pydata:latest
+    namespaceFiles:
+      enabled: true
+    env:
+      PIP_ROOT_USER_ACTION: "ignore"
+    outputFiles:
+      - "liaison.csv"
+    script: |
+      pip install --quiet openpyxl
+      python - << 'EOF'
+      import warnings
+      warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+      import pandas as pd
+      df = pd.read_excel("data/fichier_liaison.xlsx")
+      print("convert_liaison - shape Excel:", df.shape)
+      df.to_csv("liaison.csv", index=False)
+      print("convert_liaison - CSV écrit -> liaison.csv")
+      EOF
+
+  # 2) Chargement des CSV dans DuckDB
+  - id: load_duckdb
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    inputFiles:
+      erp.csv: "{{ outputs.convert_erp.outputFiles['erp.csv'] }}"
+      web.csv: "{{ outputs.convert_web.outputFiles['web.csv'] }}"
+      liaison.csv: "{{ outputs.convert_liaison.outputFiles['liaison.csv'] }}"
+    sql: |
+      CREATE OR REPLACE TABLE erp AS
+        SELECT * FROM read_csv_auto('{{ workingDir }}/erp.csv', header = TRUE);
+
+      CREATE OR REPLACE TABLE web AS
+        SELECT * FROM read_csv_auto('{{ workingDir }}/web.csv', header = TRUE);
+
+      CREATE OR REPLACE TABLE liaison AS
+        SELECT * FROM read_csv_auto('{{ workingDir }}/liaison.csv', header = TRUE);
+
+      -- LOG: nombre de lignes / colonnes après chargement
+      SELECT
+        table_name,
+        (CASE table_name
+          WHEN 'erp' THEN (SELECT COUNT(*) FROM erp)
+          WHEN 'web' THEN (SELECT COUNT(*) FROM web)
+          WHEN 'liaison' THEN (SELECT COUNT(*) FROM liaison)
+        END) AS rows,
+        COUNT(*) AS cols
+      FROM information_schema.columns
+      WHERE table_name IN ('erp','web','liaison')
+      GROUP BY table_name;
+
+  # 3) Nettoyage & dédoublonnage par clé 
+  - id: clean_tables
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      -- ERP : une ligne par product_id
+      CREATE OR REPLACE TABLE erp_clean AS
+      WITH ranked AS (
+        SELECT
+          *,
+          ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) AS rn
+        FROM erp
+        WHERE product_id IS NOT NULL
+      )
+      SELECT * FROM ranked WHERE rn = 1;
+
+      -- WEB : une ligne par sku (sans filtre additionnel)
+      CREATE OR REPLACE TABLE web_clean AS
+      WITH ranked AS (
+        SELECT
+          *,
+          ROW_NUMBER() OVER (PARTITION BY sku ORDER BY sku) AS rn
+        FROM web
+        WHERE sku IS NOT NULL
+      )
+      SELECT * FROM ranked WHERE rn = 1;
+
+      -- LIAISON : une ligne par product_id
+      CREATE OR REPLACE TABLE liaison_clean AS
+      WITH ranked AS (
+        SELECT
+          *,
+          ROW_NUMBER() OVER (PARTITION BY product_id ORDER BY product_id) AS rn
+        FROM liaison
+        WHERE product_id IS NOT NULL
+      )
+      SELECT * FROM ranked WHERE rn = 1;
+
+      -- LOG: tailles après nettoyage
+      SELECT
+        table_name,
+        (CASE table_name
+          WHEN 'erp_clean' THEN (SELECT COUNT(*) FROM erp_clean)
+          WHEN 'web_clean' THEN (SELECT COUNT(*) FROM web_clean)
+          WHEN 'liaison_clean' THEN (SELECT COUNT(*) FROM liaison_clean)
+        END) AS rows,
+        COUNT(*) AS cols
+      FROM information_schema.columns
+      WHERE table_name IN ('erp_clean','web_clean','liaison_clean')
+      GROUP BY table_name;
+
+  # 3bis) TESTS : tailles attendues après nettoyage (825 / 714 / 825)
+  - id: test_clean_counts
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      SELECT CASE
+        WHEN (SELECT COUNT(*) FROM erp_clean) = 825
+         AND (SELECT COUNT(*) FROM web_clean) = 714
+         AND (SELECT COUNT(*) FROM liaison_clean) = 825
+        THEN 1
+        ELSE 1/0
+      END AS test_clean_counts;
+
+  # 4) Jointure des trois systèmes (erp -> liaison -> web)
+  - id: join_tables
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      CREATE OR REPLACE TABLE fusion AS
+      SELECT
+        e.product_id,
+        w.post_title     AS product_name,
+        e.price,
+        e.stock_quantity AS quantity,
+        w.total_sales
+      FROM erp_clean e
+      JOIN liaison_clean l
+        ON e.product_id = l.product_id
+      JOIN web_clean w
+        ON TRY_CAST(w.sku AS BIGINT) = TRY_CAST(l.id_web AS BIGINT);
+
+      -- LOG: taille de la table fusion
+      SELECT
+        'fusion' AS table,
+        (SELECT COUNT(*) FROM fusion) AS rows,
+        (SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'fusion') AS cols;
+
+  # 4bis) TESTS : jointure cohérente, 714 lignes, pas de valeurs manquantes
+  - id: test_join
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      SELECT CASE
+        WHEN (SELECT COUNT(*) FROM fusion) = 714
+         AND (
+           SELECT COUNT(*) FROM fusion
+           WHERE product_id IS NULL
+              OR product_name IS NULL
+              OR price IS NULL
+              OR total_sales IS NULL
+         ) = 0
+        THEN 1
+        ELSE 1/0
+      END AS test_join;
+
+  # 5) Calcul du chiffre d'affaires
+  - id: compute_ca
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      CREATE OR REPLACE TABLE ca AS
+      SELECT
+        product_id,
+        product_name,
+        price,
+        total_sales,
+        price * total_sales AS chiffre_affaires
+      FROM fusion;
+
+      -- LOG: taille de la table CA + somme
+      SELECT
+        (SELECT COUNT(*) FROM ca) AS rows,
+        (SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'ca') AS cols,
+        ROUND((SELECT SUM(chiffre_affaires) FROM ca), 2) AS total_ca;
+
+  # 5bis) TESTS : cohérence du CA (valeur validée : 65 652,60 €)
+  - id: test_ca
+    type: io.kestra.plugin.jdbc.duckdb.Query
+    url: jdbc:duckdb:/tmp/kestra-wd/bottleneck.db
+    fetchType: FETCH
+    sql: |
+      SELECT CASE
+        WHEN ROUND((SELECT SUM(chiffre_affaires) FROM ca), 2) = 65652.60
+        THEN 1
+        ELSE 1/0
+      END AS test_ca;
+
+  # 6 & 7) BRANCHE PARALLÈLE : export Excel CA + détection vins premium
+  - id: exports
+    type: io.kestra.plugin.core.flow.Parallel
+    tasks:
+      # 6) Export du CA en Excel (recalcul Pandas)
+      - id: export_ca
+        type: io.kestra.plugin.scripts.shell.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        env:
+          PIP_ROOT_USER_ACTION: "ignore"
+        inputFiles:
+          erp.csv: "{{ outputs.convert_erp.outputFiles['erp.csv'] }}"
+          web.csv: "{{ outputs.convert_web.outputFiles['web.csv'] }}"
+          liaison.csv: "{{ outputs.convert_liaison.outputFiles['liaison.csv'] }}"
+        outputFiles:
+          - "rapport_chiffre_affaires.xlsx"
+        script: |
+          pip install --quiet pandas openpyxl
+          python - << 'EOF'
+          import warnings
+          warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+
+          import pandas as pd
+
+          erp = pd.read_csv("erp.csv")
+          web = pd.read_csv("web.csv")
+          liaison = pd.read_csv("liaison.csv")
+
+          print("export_ca - shapes CSV init :")
+          print("  erp      :", erp.shape)
+          print("  web      :", web.shape)
+          print("  liaison  :", liaison.shape)
+
+          # Nettoyage OC
+          erp_clean = erp.dropna(subset=["product_id"]).drop_duplicates(subset=["product_id"])
+          web_clean = web.dropna(subset=["sku"]).drop_duplicates(subset=["sku"])
+          liaison_clean = liaison.drop_duplicates(subset=["product_id"])
+
+          print("export_ca - shapes après clean :")
+          print("  erp_clean      :", erp_clean.shape)
+          print("  web_clean      :", web_clean.shape)
+          print("  liaison_clean  :", liaison_clean.shape)
+
+          # Jointure
+          fusion = (
+              erp_clean
+              .merge(liaison_clean, on="product_id")
+              .merge(web_clean, left_on="id_web", right_on="sku")
+          )
+
+          print("export_ca - shape fusion :", fusion.shape)
+
+          fusion["total_sales"] = pd.to_numeric(fusion["total_sales"], errors="coerce")
+          fusion["price"] = pd.to_numeric(fusion["price"], errors="coerce")
+
+          df = fusion[["product_id", "post_title", "price", "total_sales"]].copy()
+          df = df.rename(columns={"post_title": "product_name"})
+          df["chiffre_affaires"] = df["price"] * df["total_sales"]
+
+          total_ca = round(float(df["chiffre_affaires"].sum()), 2)
+          expected = 65652.60
+          print("export_ca - shape final df :", df.shape)
+          print("export_ca - CA total (Pandas) :", total_ca)
+          assert total_ca == expected, f"CA total attendu = {expected}, obtenu = {total_ca}"
+
+          resume = pd.DataFrame({
+              "indicateur": ["Nombre de lignes", "Chiffre d'affaires total (€)"],
+              "valeur": [int(df.shape[0]), total_ca]
+          })
+
+          with pd.ExcelWriter("rapport_chiffre_affaires.xlsx", engine="openpyxl") as writer:
+              df.to_excel(writer, sheet_name="Détail_CA", index=False)
+              resume.to_excel(writer, sheet_name="Résumé", index=False)
+
+          print("export_ca - fichier rapport_chiffre_affaires.xlsx généré")
+          EOF
+
+      # 7) Détection des vins premium (z-score > 2) et export CSV propres
+      - id: premium_detection
+        type: io.kestra.plugin.scripts.shell.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: ghcr.io/kestra-io/pydata:latest
+        inputFiles:
+          erp.csv: "{{ outputs.convert_erp.outputFiles['erp.csv'] }}"
+          web.csv: "{{ outputs.convert_web.outputFiles['web.csv'] }}"
+          liaison.csv: "{{ outputs.convert_liaison.outputFiles['liaison.csv'] }}"
+        outputFiles:
+          - "vins_premium.csv"
+          - "vins_ordinaires.csv"
+        script: |
+          python - << 'EOF'
+          import pandas as pd
+
+          erp = pd.read_csv("erp.csv")
+          web = pd.read_csv("web.csv")
+          liaison = pd.read_csv("liaison.csv")
+
+          print("premium_detection - shapes CSV init :")
+          print("  erp      :", erp.shape)
+          print("  web      :", web.shape)
+          print("  liaison  :", liaison.shape)
+
+          # Nettoyage OC
+          erp_clean = erp.dropna(subset=["product_id"]).drop_duplicates(subset=["product_id"])
+          web_clean = web.dropna(subset=["sku"]).drop_duplicates(subset=["sku"])
+          liaison_clean = liaison.drop_duplicates(subset=["product_id"])
+
+          print("premium_detection - shapes après clean :")
+          print("  erp_clean      :", erp_clean.shape)
+          print("  web_clean      :", web_clean.shape)
+          print("  liaison_clean  :", liaison_clean.shape)
+
+          # Jointure
+          fusion = (
+              erp_clean
+              .merge(liaison_clean, on="product_id")
+              .merge(web_clean, left_on="id_web", right_on="sku")
+          )
+
+          print("premium_detection - shape fusion :", fusion.shape)
+
+          # Z-score prix ERP
+          prices = pd.to_numeric(fusion["price"], errors="coerce")
+          mean = prices.mean()
+          std = prices.std()
+
+          fusion["zscore"] = (prices - mean) / std
+          fusion["premium"] = fusion["zscore"] > 2
+
+          assert fusion["zscore"].isna().sum() == 0, "Des z-scores sont manquants"
+
+          fusion["total_sales"] = pd.to_numeric(fusion["total_sales"], errors="coerce")
+          fusion["price"] = pd.to_numeric(fusion["price"], errors="coerce")
+          fusion["chiffre_affaires"] = fusion["price"] * fusion["total_sales"]
+
+          # Colonnes métier propres
+          cols = [
+              "product_id",
+              "post_title",
+              "price",
+              "total_sales",
+              "chiffre_affaires",
+              "zscore",
+              "premium"
+          ]
+          out = fusion[cols].rename(columns={"post_title": "product_name"})
+
+          premium = out[out["premium"]]
+          ordinary = out[~out["premium"]]
+
+          premium_count = int(premium.shape[0])
+          print("premium_detection - premium shape :", premium.shape)
+          print("premium_detection - ordinary shape :", ordinary.shape)
+          assert premium_count == 30, f"Nombre de vins premium attendu = 30, obtenu = {premium_count}"
+
+          premium.to_csv("vins_premium.csv", index=False)
+          ordinary.to_csv("vins_ordinaires.csv", index=False)
+
+          print(f"Exports propres OK, vins premium = {premium_count}")
+          EOF
+
+triggers:
+  - id: monthly15-09h
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 9 15 * *"
