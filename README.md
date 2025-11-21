@@ -218,7 +218,7 @@ docker-compose up -d
 
 Kestra accessible sur :
 
-```URL : "http://localhost:8080"```
+```URL :``` "http://localhost:8080"
 
 ### 2️⃣ Déclarer le workflow
 
@@ -261,4 +261,5 @@ Toutes les valeurs ont été validées automatiquement via les steps test_*.
 ## Conclusion
 
 Ce pipeline Kestra offre une solution complète, robuste et automatisée pour consolider, contrôler et analyser les données produits.
+
 Il adopte une architecture professionnelle et garantit la fiabilité des résultats via des tests intégrés.
