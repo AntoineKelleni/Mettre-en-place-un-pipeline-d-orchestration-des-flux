@@ -5,7 +5,7 @@
 # Pipeline d'orchestration de flux : Traitement & Analyse de Données – Kestra + DuckDB + Pandas
 ## Introduction
 <p align="center">
-  <img src="screenshoot_diagram.png" alt="Logo Academy" width="200">
+  <img src="screenshoot_diagram.png" alt="Logo Academy" width="1000">
 </p>
 Ce projet met en place un pipeline data complet, automatisé et industrialisé avec Kestra, permettant :
 
@@ -265,4 +265,5 @@ Toutes les valeurs ont été validées automatiquement via les steps test_*.
 Ce pipeline Kestra offre une solution complète, robuste et automatisée pour consolider, contrôler et analyser les données produits.
 
 Il adopte une architecture professionnelle et garantit la fiabilité des résultats via des tests intégrés.
+
 
